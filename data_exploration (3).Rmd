@@ -1,0 +1,575 @@
+---
+title: 'IDS 570 — Data Exploration: Political Economies Corpus'
+Name: Farnoosh Memari
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+  html_document:
+    latex_engine: xelatex
+    toc: true
+    toc_float: true
+    theme: flatly
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,    
+  message = FALSE,  
+  warning = FALSE   
+)
+```
+
+------------------------------------------------------------------------
+
+# Install & Load Packages
+
+```{r packages}
+# Run install only once — comment out after first use
+# install.packages(c(
+#   "quanteda", "quanteda.textstats",
+#   "tidyverse", "udpipe", "tidytext", "ggplot2", "scales"
+# ))
+
+library(quanteda)
+library(quanteda.textstats)
+library(tidyverse)
+library(udpipe)
+library(tidytext)
+library(ggplot2)
+library(scales)
+```
+
+------------------------------------------------------------------------
+
+# Load Corpus
+
+> **Instructions:** Place this `.Rmd` file in the **same folder** as your 20 `.txt` files. The script detects them automatically.
+
+```{r load-files}
+txt_files <- list.files(".", pattern = "\\.txt$", full.names = TRUE)
+
+cat("Files found:", length(txt_files), "\n")
+cat(basename(txt_files), sep = "\n")
+```
+
+```{r short-labels}
+short_labels <- c(
+  "A06785"  = "Strong_Imag",
+  "A06786"  = "Law_Merchant",
+  "A06788"  = "Relig_Justice",
+  "A06789"  = "Three_Essent",
+  "A06790"  = "April",
+  "A06791"  = "Wealth_Realm",
+  "A07886"  = "Trade_Rules",
+  "A32827"  = "Discourse_1",
+  "A32828"  = "Fallen_Man",
+  "A32829"  = "Wool_Manuf",
+  "A32830"  = "EastIndia_Def",
+  "A32833"  = "Discourse_2",
+  "A32836"  = "Poor_Eng_1",
+  "A32837"  = "Interest_Hol",
+  "A32838"  = "EastIndia_Co",
+  "A32839"  = "Trade_Op_1",
+  "A50763"  = "Poor_Eng_2",
+  "A51598"  = "Treasure",
+  "A69858"  = "Trade_Op_2",
+  "A93819"  = "Lion_Key"
+)
+
+# sapply returns a named character vector — required by corpus()
+raw_texts <- setNames(
+  sapply(txt_files, function(f) paste(readLines(f, warn = FALSE), collapse = " "),
+         USE.NAMES = FALSE),
+  tools::file_path_sans_ext(basename(txt_files))
+)
+
+matched   <- intersect(names(raw_texts), names(short_labels))
+raw_texts <- raw_texts[matched]
+names(raw_texts) <- short_labels[matched]
+
+cat("\nDocuments loaded:\n")
+cat(names(raw_texts), sep = "\n")
+```
+
+------------------------------------------------------------------------
+
+# Step 0 — Normalization
+
+**Required:** normalize the long S character (`ſ` \-> `s`).
+
+**Additional choices:**
+
+-   **Remove numbers:** pagination markers, folio numbers, and running totals create spurious tokens that inflate TF-IDF scores without reflecting content.
+-   **Collapse whitespace:** EEBO transcriptions sometimes have irregular spacing due to original typesetting.
+-   We do **not** normalize `u/v`, `i/j`, or variant spellings. These are meaningful signals of register and date; normalizing them would erase the lexical distinctiveness we aim to measure.
+
+```{r normalize}
+normalize_text <- function(txt) {
+  txt <- gsub("\u017f", "s", txt)   # long S -> s (required)
+  txt <- gsub("[0-9]+", "", txt)    # remove numbers
+  txt <- gsub("\\s+", " ", txt)    # collapse whitespace
+  trimws(txt)
+}
+
+clean_texts <- sapply(raw_texts, normalize_text, USE.NAMES = TRUE)
+corp        <- corpus(clean_texts)
+
+cat("Corpus summary:\n")
+print(summary(corp, n = 20))
+```
+
+------------------------------------------------------------------------
+
+# Approach 1 — TF-IDF: Lexical Distinctiveness
+
+## Build DFM and compute TF-IDF
+
+```{r tfidf-dfm}
+toks <- tokens(corp,
+               remove_punct   = TRUE,
+               remove_symbols = TRUE,
+               remove_numbers = TRUE) %>%
+  tokens_tolower() %>%
+  tokens_remove(stopwords("en"))
+
+dfm_counts <- dfm(toks)
+dfm_tfidf  <- dfm_tfidf(dfm_counts)
+
+cat("DFM dimensions (documents x features):", dim(dfm_counts), "\n")
+```
+
+## Extract top terms per document
+
+```{r tfidf-table}
+library(dplyr)
+library(tibble)
+library(knitr)
+
+get_top_tfidf <- function(dfm_obj, doc_name, n = 12) {
+  row_vec  <- as.numeric(dfm_obj[doc_name, ])
+  feat_nam <- featnames(dfm_obj)
+  ord      <- order(row_vec, decreasing = TRUE)
+
+  tibble(
+    document = doc_name,
+    term     = feat_nam[ord[seq_len(n)]],
+    tfidf    = round(row_vec[ord[seq_len(n)]], 3)
+  )
+}
+
+tfidf_table <- bind_rows(
+  lapply(docnames(dfm_tfidf), get_top_tfidf, dfm_obj = dfm_tfidf, n = 12)
+)
+
+kable(tfidf_table)
+```
+
+## TF-IDF ECDF heatmap: term x document
+
+Rather than plotting raw TF-IDF scores — which vary enormously in scale across documents of different lengths — we convert each document's scores to within-document ECDF percentiles. A value of 1.00 means that term is in the very top of that document's TF-IDF distribution. This makes all 20 documents directly comparable on the same color scale.
+
+```{r tfidf-ecdf-heatmap, fig.width=15, fig.height=12}
+# Top 3 terms per document, deduplicated across documents
+top3_terms <- tfidf_table %>%
+  group_by(document) %>%
+  slice_max(order_by = tfidf, n = 3) %>%
+  ungroup() %>%
+  pull(term) %>%
+  unique()
+
+# Build full grid and compute ECDF within each document
+heat_ecdf <- tfidf_table %>%
+  # keep all terms for ECDF calculation, then filter to the top-3 set for display
+  group_by(document) %>%
+  mutate(ecdf_val = ecdf(tfidf)(tfidf)) %>%   # percentile within this document
+  ungroup() %>%
+  filter(term %in% top3_terms) %>%
+  complete(document, term, fill = list(tfidf = 0, ecdf_val = NA))
+
+# Order terms: those with the highest mean ECDF (most consistently high) at top
+term_order <- heat_ecdf %>%
+  group_by(term) %>%
+  summarise(mean_ecdf = mean(ecdf_val, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(mean_ecdf)) %>%
+  pull(term)
+
+heat_ecdf <- heat_ecdf %>%
+  mutate(
+    term     = factor(term,     levels = rev(term_order)),
+    document = factor(document, levels = sort(unique(document)))
+  )
+
+ggplot(heat_ecdf, aes(x = document, y = term, fill = ecdf_val)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_gradientn(
+    colours  = c("#440154FF", "#3B528BFF", "#21908CFF", "#5DC863FF", "#FDE725FF"),
+    na.value = "grey90",
+    name     = "ECDF\nwithin doc",
+    labels   = label_number(accuracy = 0.01)
+  ) +
+  labs(
+    title    = "TF-IDF Distinctiveness (ECDF Heatmap)",
+    subtitle = "Fill is the within-document cumulative percentile of TF-IDF score\nYellow = term is in the very top of that document's TF-IDF distribution",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x   = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y   = element_text(size = 8),
+    panel.grid    = element_blank(),
+    plot.title    = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(size = 10),
+    legend.position = "right"
+  )
+```
+
+## TF-IDF terms shared across 5+ documents
+
+```{r tfidf-shared}
+shared_tfidf <- tfidf_table %>%
+  group_by(term) %>%
+  summarise(
+    n_docs     = n_distinct(document),
+    mean_tfidf = round(mean(tfidf), 3),
+    .groups    = "drop"
+  ) %>%
+  filter(n_docs >= 5) %>%
+  arrange(desc(mean_tfidf))
+
+cat("TF-IDF terms appearing in 5 or more documents:\n")
+print(shared_tfidf, n = 30)
+```
+
+---
+
+**Interpretive Questions — TF-IDF**
+
+*Do some documents share distinctive vocabulary?*
+
+Yes, and the pattern of sharing is itself analytically meaningful. The ECDF heatmap shows a core set of terms — `trade`, `kingdom`, `commodities`, `exchange`, `realm`, `monies` — appearing near the top of the TF-IDF distribution across multiple documents. These are simultaneously distinctive within individual texts and shared across the corpus, which is what we would expect from a set of texts belonging to the same intellectual tradition.
+
+Beyond this core, the heatmap reveals clear sub-group clustering. The East India documents (`EastIndia_Def`, `EastIndia_Co`, `Trade_Op_1`, `Trade_Op_2`) share terms like `india`, `company`, `bantam`, `surrat`. The poverty documents (`Poor_Eng_1`, `Poor_Eng_2`) share `poor`, `parish`, `fathers`, `hospitals`. `Lion_Key` (A93819) introduces a third distinct register: legal-property vocabulary — `wharfige`, `defendant`, `stairs`, `campshiot`, `indicted` — that does not appear in any other document's top TF-IDF terms. This confirms the corpus contains several distinct sub-traditions within the broader label of political economy.
+
+*Are distinctive terms topical, rhetorical, or technical?*
+
+The terms divide into three types. *Technical terms* dominate the trade-theory texts: `exchange`, `bullion`, `starlin`, `fineness`, `ounces` — the financial vocabulary of merchants computing rates of exchange. *Topical terms* characterize the East India and poverty texts: `bantam`, `surrat`, `parish`, `hospitals` are distinctive because their topic is concentrated in a subset of documents. *Legal-procedural terms* are exclusive to `Lion_Key`: `defendant`, `indicted`, `wharfige`, `campshiot`, `indenture`, `conveyances`. This is the language of court records and property deeds — not rhetorical or argumentative, but evidentiary. `Lion_Key` participates in political economy debates through an entirely different genre: the legal defense brief.
+
+*Are there documents whose distinctiveness seems driven by noise or formatting?*
+
+`Law_Merchant` (A06786) shows high TF-IDF for the single letter `l`, almost certainly an EEBO artifact where the pound sign £ was transcribed as `l` (for *libra*) in financial tables. `April` is distinctive not because of noise but because of genre — its top terms (`monster`, `dragon`, `maketh`) are literary and allegorical. In `Lion_Key`, unique proper nouns like `brumskell` and `campshiot` may have high TF-IDF because they are document-specific to this legal case rather than representing broader economic vocabulary.
+
+------------------------------------------------------------------------
+
+# Approach 2 — Pearson Correlation: Similarity Between Texts
+
+## Compute pairwise correlations
+
+```{r pearson-compute}
+# Trim features appearing in fewer than 5 documents.
+# Very rare words (OCR noise, Greek script residues) push Pearson
+# correlations toward zero without reflecting genuine similarity.
+dfm_trimmed <- dfm_trim(dfm_counts, min_termfreq = 5)
+
+cat("Trimmed DFM dimensions:", dim(dfm_trimmed), "\n")
+
+sim_r       <- textstat_simil(dfm_trimmed, margin = "documents", method = "correlation")
+r_mat       <- as.matrix(sim_r)
+r_mat       <- round(r_mat, 3)
+diag(r_mat) <- 1
+```
+
+## Most and least similar pairs
+
+```{r pearson-pairs}
+r_long <- as.data.frame(r_mat) %>%
+  rownames_to_column("doc_i") %>%
+  pivot_longer(-doc_i, names_to = "doc_j", values_to = "r") %>%
+  filter(doc_i < doc_j)
+
+cat("=== Two MOST similar document pairs ===\n")
+print(r_long %>% arrange(desc(r)) %>% head(2))
+
+cat("\n=== Two LEAST similar document pairs ===\n")
+print(r_long %>% arrange(r) %>% head(2))
+
+cat("\n=== Top 10 most similar pairs ===\n")
+print(r_long %>% arrange(desc(r)) %>% head(10))
+```
+
+## Similarity heatmap
+
+```{r pearson-heatmap, fig.width=11, fig.height=10}
+heat_df <- as.data.frame(r_mat) %>%
+  rownames_to_column("doc_i") %>%
+  pivot_longer(-doc_i, names_to = "doc_j", values_to = "r")
+
+ggplot(heat_df, aes(x = doc_j, y = doc_i, fill = r)) +
+  geom_tile(color = "white", linewidth = 0.25) +
+  coord_fixed() +
+  scale_fill_gradient2(
+    low      = "#2166ac",
+    mid      = "white",
+    high     = "#d6604d",
+    midpoint = 0,
+    name     = "Pearson r"
+  ) +
+  geom_text(aes(label = sprintf("%.2f", r)), size = 2.2, color = "black") +
+  labs(
+    title    = "Pearson Correlation Between Documents",
+    subtitle = "DFM trimmed to features appearing in >= 5 documents",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, size = 7),
+    axis.text.y  = element_text(size = 7),
+    panel.grid   = element_blank(),
+    plot.title   = element_text(face = "bold")
+  )
+```
+
+---
+
+**Interpretive Questions — Pearson Correlation**
+
+*Two most similar document pairs*
+
+The two most similar pairs are `Discourse_1`/`Discourse_2` and `Poor_Eng_1`/`Poor_Eng_2`, both with r approaching 1.00. These near-perfect correlations reflect textual near-identity: both pairs share identical or near-identical opening paragraphs and use the same vocabulary in essentially the same proportions. This is not a sign of intellectual convergence — it is a signature of reprinting or revised editions. A Pearson r of 1.00 means "same words, same rates," which is a corpus-construction finding as much as an intellectual one.
+
+After these near-duplicates, the next tier of high correlations appears among the Malynes-era texts (`Three_Essent`, `Wealth_Realm`, `Strong_Imag`) and within the East India cluster. These moderate correlations (r ≈ 0.4–0.7) reflect genuine shared vocabulary from intellectual engagement within the same debate.
+
+*Two least similar document pairs*
+
+The least similar pairs involve `April` (A06790). Its literary and allegorical vocabulary — `monster`, `dragon`, `island`, `smell` — shares almost nothing with the trade-theory documents, producing near-zero or negative Pearson correlations with virtually every other text. `Lion_Key` (A93819) is also expected to show low correlations with most documents: its legal-property vocabulary (`wharfige`, `defendant`, `campshiot`) is too document-specific to survive the `min_termfreq = 5` trimming, further reducing its overlap with the shared corpus vocabulary. Both texts are genre outliers, but in opposite directions.
+
+*What questions does the similarity pattern generate?*
+
+First: the near-duplicate pairs (`Discourse_1`/`Discourse_2`, `Poor_Eng_1`/`Poor_Eng_2`) raise a corpus-construction question — are these genuinely independent documents or different editions of the same text? If the latter, they are double-weighting their content in corpus-wide statistics. Second: where does `Lion_Key` sit relative to the two main clusters? Its connection to Josiah Child — a central figure in the East India debate — suggests intellectual proximity to that cluster, but its legal register keeps its Pearson r low with all documents. This is a case where correlation alone cannot capture the intellectual relationship. Third: `April`'s near-zero correlations raise the question of why it appears in a political economy corpus at all — a genre question that the quantitative methods can flag but cannot answer on their own.
+
+------------------------------------------------------------------------
+
+# Approach 3 — Syntactic Complexity Profile
+
+**Text selection rationale:**
+
+After examining the TF-IDF heatmap and the Pearson correlations, two texts stand out as a productive pair:
+
+-   **`April`** (A06790): an allegorical dream narrative with vivid literary prose, stylistically unlike the rest of the corpus. Its top TF-IDF terms (`monster`, `dragon`, `maketh`) are literary rather than economic, and it is the clearest outlier in the Pearson heatmap — near-zero correlations with every other document.
+
+-   **`Lion_Key`** (A93819 — the legal defense of Josiah Child's wharf at Lion Key): a short legal brief whose top TF-IDF terms are entirely procedural and property-specific (`wharfige`, `defendant`, `stairs`, `campshiot`, `indicted`). It also sits at the edge of the Pearson space due to its genre-specific vocabulary.
+
+These two were selected because they represent the two most genre-distinct texts in the corpus: one literary allegory, one legal brief. Both are lexical outliers, but in opposite directions. Comparing their syntax tests whether the genre difference is purely lexical or also structural.
+
+## Download / load udpipe model
+
+```{r udpipe-model}
+# Checks whether the model is already saved locally; downloads only once.
+model_file <- list.files(".", pattern = "english.*\\.udpipe$", full.names = TRUE)
+
+if (length(model_file) == 0) {
+  cat("Downloading English udpipe model (one-time, ~15 MB)...\n")
+  dl         <- udpipe_download_model(language = "english")
+  model_file <- dl$file_model
+} else {
+  model_file <- model_file[1]
+  cat("Using existing model:", model_file, "\n")
+}
+
+ud_model <- udpipe_load_model(model_file)
+cat("Model loaded.\n")
+```
+
+## Annotate the two texts
+
+```{r udpipe-annotate}
+# as.character(corpus_obj)[doc_name]  — correct way to extract text
+# corpus_obj[doc_name] returns a corpus object, not a string -> error
+annotate_doc <- function(doc_name, model, corpus_obj) {
+  txt <- as.character(corpus_obj)[doc_name]
+  ann <- udpipe_annotate(model, x = txt, doc_id = doc_name)
+  as.data.frame(ann)
+}
+
+cat("Annotating April (this may take a minute)...\n")
+ann_april    <- annotate_doc("April",    ud_model, corp)
+
+cat("Annotating Lion_Key (this may take a minute)...\n")
+ann_lion_key <- annotate_doc("Lion_Key", ud_model, corp)
+
+cat("Annotation complete.\n")
+cat("April tokens:",    nrow(ann_april),    "\n")
+cat("Lion_Key tokens:", nrow(ann_lion_key), "\n")
+```
+
+## Compute complexity measures
+
+```{r complexity-compute}
+compute_complexity <- function(ann, doc_name) {
+
+  sent_stats <- ann %>%
+    group_by(sentence_id) %>%
+    summarise(
+      n_tokens      = n(),
+      n_clauses     = sum(upos == "VERB", na.rm = TRUE),
+      n_dep_clauses = sum(dep_rel %in% c("advcl","relcl","ccomp","xcomp","acl"),
+                          na.rm = TRUE),
+      n_coord       = sum(dep_rel == "cc",  na.rm = TRUE),
+      n_cn          = sum(dep_rel %in% c("compound","amod","nmod","nummod"),
+                          na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(n_tokens > 2)
+
+  total_clauses <- sum(sent_stats$n_clauses)
+
+  data.frame(
+    Document  = doc_name,
+    MLS       = round(mean(sent_stats$n_tokens),      2),
+    `C/S`     = round(mean(sent_stats$n_clauses),     3),
+    `DC/S`    = round(mean(sent_stats$n_dep_clauses), 3),
+    `DC/C`    = round(ifelse(total_clauses > 0,
+                  sum(sent_stats$n_dep_clauses) / total_clauses, NA), 3),
+    `Coord/S` = round(mean(sent_stats$n_coord),       3),
+    `Coord/C` = round(ifelse(total_clauses > 0,
+                  sum(sent_stats$n_coord) / total_clauses, NA),  3),
+    `CN/S`    = round(mean(sent_stats$n_cn),          3),
+    `CN/C`    = round(ifelse(total_clauses > 0,
+                  sum(sent_stats$n_cn) / total_clauses, NA),     3),
+    check.names = FALSE
+  )
+}
+
+complexity_table <- bind_rows(
+  compute_complexity(ann_april,    "April"),
+  compute_complexity(ann_lion_key, "Lion_Key")
+)
+
+cat("=== Syntactic Complexity Profile ===\n")
+print(complexity_table)
+```
+
+## Example sentences
+
+```{r example-sentences}
+get_long_sentences <- function(ann, n = 3) {
+  ann %>%
+    group_by(sentence_id, sentence) %>%
+    summarise(len = n(), .groups = "drop") %>%
+    arrange(desc(len)) %>%
+    slice_head(n = n) %>%
+    pull(sentence)
+}
+
+cat("--- Three longest sentences from April ---\n\n")
+invisible(lapply(get_long_sentences(ann_april),    function(s) cat(s, "\n\n")))
+
+cat("--- Three longest sentences from Lion_Key ---\n\n")
+invisible(lapply(get_long_sentences(ann_lion_key), function(s) cat(s, "\n\n")))
+```
+
+## Syntactic complexity lollipop chart
+
+```{r complexity-plot, fig.width=10, fig.height=5}
+complexity_long <- complexity_table %>%
+  pivot_longer(-Document, names_to = "Measure", values_to = "Value") %>%
+  mutate(Measure = factor(Measure,
+                          levels = c("MLS","C/S","DC/S","DC/C",
+                                     "Coord/S","Coord/C","CN/S","CN/C")))
+
+# FIX: no position_dodge anywhere.
+# position_dodge shifts points left/right but geom_line stays centered,
+# so one set of points gets disconnected from the line and disappears visually.
+# Without dodge, both dots sit at the same x, connected by a vertical grey
+# segment — which is exactly what a lollipop comparison chart should show.
+ggplot(complexity_long, aes(x = Measure, y = Value, color = Document)) +
+  geom_line(aes(group = Measure), color = "grey60", linewidth = 1.2) +
+  geom_point(size = 6, alpha = 0.95) +
+  scale_color_manual(values = c("April" = "#1b7837", "Lion_Key" = "#762a83")) +
+  labs(
+    title    = "Syntactic Complexity: April vs. Lion Key",
+    subtitle = "Each point = one document; vertical line = gap between them per measure\nMLS = mean sentence length  |  C/S = clauses/sentence  |  DC = dependent clauses  |  CN = complex nominals",
+    x        = NULL,
+    y        = "Value",
+    color    = "Document"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x      = element_text(angle = 30, hjust = 1, size = 10),
+    legend.position  = "top",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+---
+
+**Interpretive Questions — Syntactic Complexity**
+
+*How do the two texts differ in syntactic complexity?*
+
+`Lion_Key` is more syntactically complex than `April` on the subordination-related measures (DC/S, DC/C) and on complex nominals (CN/S, CN/C). Its sentences are long legal periods that build numbered chains of evidence: each numbered point introduces a claim followed by conditional and relative clauses specifying exceptions, precedents, and the precise scope of the argument. The high DC/C ratio means nearly every clause is embedded within another — a defining feature of legal prose, where subordination encodes the conditions under which a claim holds.
+
+`April` achieves comparable sentence length through a different mechanism: coordination and descriptive accumulation. Its sentences string landscape images and allegorical figures together with `and`, `or`, `but`, and the repeated `of...of...of` prepositional structure. The result is sentences that are long by word count but syntactically shallow — the dependency tree is wide rather than deep. `April` may show higher Coord/S and Coord/C, reflecting this additive structure.
+
+*Example sentence from April illustrating additive coordination:*
+
+> "Me thought according to the provoked motion, that being in a ship sailing on the seas with a prosperous wind and pleasant travel, I did arrive into a most fruitful Island, whose beautiful and pleasant sight, with savoury and delicious fruits distilling the juice of Nectar, ministrated such delight and health unto my wearied bones and drowsy mind, that by the delectable object of mine eyes, of fair running rivers with their silver streams, of green fields with their variety of flowers, of easy high ways set with fruit-trees on every side..."
+
+*Example sentence from Lion_Key illustrating legal subordination:*
+
+> "For by Act of Parliament made in the Fourteenth Year of His Majesty's Reign, among other things, it is Enacted, That the King's Majesty may by Commission under His Majesty's Seal of the Exchequer appoint such Persons as His Majesty shall think fit, for the Assigning and Appointing of all such and so many Open places to be Keys and Wharves, as shall be meet for the Shipping and Landing of Goods; and settling all those Places by sufficient Meets, Limits, and Bounds."
+
+*Do these differences align with or complicate the lexical findings?*
+
+The syntactic findings confirm the lexical findings and add an important dimension. TF-IDF and Pearson both identified `April` and `Lion_Key` as texts with distinctive but radically different vocabularies — one literary, one legal-procedural. The syntactic analysis shows they are also organized differently at the sentence level: `April` through descriptive coordination, `Lion_Key` through evidentiary subordination. A text can use unusual vocabulary while sharing the syntactic organization of its peers; the fact that both texts differ syntactically as well as lexically makes the genre difference a more robust and structural finding.
+
+*What rhetorical or stylistic practices do these patterns reflect?*
+
+`April`'s syntactic profile — coordination, accumulation, imagistic parallelism — is characteristic of epideictic rhetoric: the mode of vivid description and praise that proceeds by heaping up examples rather than reasoning toward a conclusion. `Lion_Key`'s syntactic profile — dense subordination, complex nominals from legal formulae (`Indenture of Bargain and Sale`, `Deed indented and enrolled in Chancery`), chains of conditional and relative clauses — is characteristic of legal-procedural writing, where every sentence must specify the conditions, precedents, and institutional authorities that make a claim valid. Both texts participate in political economy debates, but through entirely different institutional and rhetorical modes.
+
+------------------------------------------------------------------------
+
+# Synthesis: Shared TF-IDF Terms
+
+```{r synthesis-shared, fig.width=9, fig.height=5}
+shared_tfidf %>%
+  slice_max(order_by = mean_tfidf, n = 20) %>%
+  mutate(term = fct_reorder(term, mean_tfidf)) %>%
+  ggplot(aes(x = term, y = mean_tfidf, fill = n_docs)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_distiller(palette = "YlOrRd", direction = 1, name = "# docs") +
+  labs(
+    title    = "Top Shared TF-IDF Terms (present in >= 5 documents)",
+    subtitle = "Terms that are both distinctive within documents AND shared across many — core corpus vocabulary",
+    x        = NULL,
+    y        = "Mean TF-IDF across documents"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+**Synthesis — Triangulating Evidence**
+
+The central analytical question this analysis generates is: **what defines membership in the "political economy" tradition — shared topic, shared vocabulary, or shared genre?**
+
+From **TF-IDF**, the corpus divides into three topical clusters (monetary/exchange, colonial trade, poverty/governance) plus two genre outliers (`April` and `Lion_Key`). The shared terms chart confirms a core vocabulary (`trade`, `kingdom`, `commodities`, `realm`) that cuts across most documents. But `Lion_Key` and `April` both address concerns that belong to political economy while using entirely different vocabularies: one through legal evidence, one through allegory. TF-IDF is powerful at identifying what makes each text distinctive, but it cannot explain why two texts in the same tradition can look so different lexically — for that, we need genre as an analytical category.
+
+From **Pearson correlation**, the near-duplicate pairs dominate the upper end of the similarity range and should be treated as a corpus-construction finding rather than an intellectual one. After accounting for them, two loose clusters emerge (1620s exchange texts and 1680s Company texts), confirming the TF-IDF sub-groups. Both `April` and `Lion_Key` sit at the periphery of the correlation space, but for different reasons: `April` because its vocabulary is literary, `Lion_Key` because its legal vocabulary is too document-specific to survive the frequency trimming. Pearson shows that both are isolated from the main clusters but cannot distinguish whether that isolation reflects genuine genre difference, topical difference, or data sparsity.
+
+From **syntactic complexity**, the contrast between `April` and `Lion_Key` confirms that genre difference is structural as well as lexical. `April` builds complexity through coordination and accumulation (epideictic rhetoric); `Lion_Key` builds it through subordination and evidentiary embedding (legal-procedural writing). Two texts can both be "outliers" in TF-IDF and Pearson for entirely different structural reasons — and only syntactic analysis reveals this distinction.
+
+**Methodological reflection:** TF-IDF is effective at identifying topical distinctiveness but sensitive to document length and rare noise tokens. Pearson correlation is effective at revealing broad similarity clusters but dominated by near-duplicates and suppressed by genre-specific vocabulary that fails the frequency threshold. Syntactic complexity is the deepest of the three — it reveals how texts are organized rather than what they contain — but is the most sensitive to parsing errors on Early Modern English. Together, all three approaches converge on the same picture: the corpus is not a unified discourse but a rhetorical field in which a shared concern with trade and property is pursued through radically different genres and argumentative modes.
+
+------------------------------------------------------------------------
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
